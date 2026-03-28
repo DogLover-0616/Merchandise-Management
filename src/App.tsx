@@ -1,49 +1,89 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { 
-  Package, 
-  Plus, 
-  Trash2, 
-  Edit3, 
-  CheckCircle2, 
-  Truck, 
-  Clock, 
-  XCircle,
-  TrendingUp,
-  JapaneseYen
+  Package, Plus, Trash2, Edit3, CheckCircle2, Truck, Clock, 
+  XCircle, TrendingUp, JapaneseYen, LogOut, LogIn, FolderOpen, BarChart3
 } from 'lucide-react';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { auth, db, provider } from './firebase';
+import { signInWithPopup, signOut, onAuthStateChanged, User } from 'firebase/auth';
+import { collection, query, where, onSnapshot, addDoc, updateDoc, deleteDoc, doc, Timestamp } from 'firebase/firestore';
 
 type Status = '発送待ち' | '発送済み' | '取引終了' | 'キャンセル予定';
+
+interface Category {
+  id: string;
+  name: string;
+  userId: string;
+  createdAt?: any;
+}
 
 interface Product {
   id: string;
   name: string;
+  categoryId: string;
   purchasePrice: number;
   salePrice: number;
   status: Status;
   purchaseDate: string;
   shippingDate: string;
   completionDate: string;
+  userId: string;
+  createdAt?: any;
 }
 
-const STORAGE_KEY = 'venda_management_products';
-
 export default function App() {
-  const [products, setProducts] = useState<Product[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error('Failed to parse saved products', e);
-      }
-    }
-    return [];
-  });
+  const [user, setUser] = useState<User | null>(null);
+  const [products, setProducts] = useState<Product[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
   const [showForm, setShowForm] = useState(false);
+  const [showCategoryMaster, setShowCategoryMaster] = useState(false);
+  const [newCategoryName, setNewCategoryName] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
   
-  const [formData, setFormData] = useState<Omit<Product, 'id'>>({
+  const [activeTab, setActiveTab] = useState<'list' | 'chart'>('list');
+  const [chartPeriodType, setChartPeriodType] = useState<'month' | 'custom'>('month');
+  const [chartMonth, setChartMonth] = useState(() => new Date().toISOString().slice(0, 7));
+  const [chartStartDate, setChartStartDate] = useState(() => {
+    const d = new Date();
+    d.setMonth(d.getMonth() - 1);
+    return d.toISOString().slice(0, 10);
+  });
+  const [chartEndDate, setChartEndDate] = useState(() => new Date().toISOString().slice(0, 10));
+
+  const chartData = useMemo(() => {
+    const filtered = products.filter(p => {
+      // 完了済みのみを対象
+      if (p.status !== '取引終了') return false; 
+      if (!p.completionDate) return false;
+      
+      if (chartPeriodType === 'month') {
+        return p.completionDate.startsWith(chartMonth);
+      } else {
+        return (!chartStartDate || p.completionDate >= chartStartDate) && 
+               (!chartEndDate || p.completionDate <= chartEndDate);
+      }
+    });
+
+    const profitMap = new Map<string, number>();
+    filtered.forEach(p => {
+       const profit = p.salePrice - p.purchasePrice;
+       const catId = p.categoryId || 'uncategorized';
+       profitMap.set(catId, (profitMap.get(catId) || 0) + profit);
+    });
+
+    const data = Array.from(profitMap.entries()).map(([catId, profit]) => {
+      if (catId === 'uncategorized') return { name: '未分類', profit };
+      const cat = categories.find(c => c.id === catId);
+      return { name: cat ? cat.name : '不明', profit };
+    });
+    
+    data.sort((a, b) => b.profit - a.profit);
+    return data;
+  }, [products, categories, chartPeriodType, chartMonth, chartStartDate, chartEndDate]);
+  
+  const [formData, setFormData] = useState<Omit<Product, 'id' | 'userId' | 'createdAt'>>({
     name: '',
+    categoryId: '',
     purchasePrice: 0,
     salePrice: 0,
     status: '発送待ち',
@@ -52,29 +92,110 @@ export default function App() {
     completionDate: ''
   });
 
-  // Save to local storage
+  // Auth listener
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(products));
-  }, [products]);
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+    });
+    return () => unsubscribe();
+  }, []);
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (editingId) {
-      setProducts(prev => prev.map(p => p.id === editingId ? { ...formData, id: p.id } : p));
-      setEditingId(null);
-    } else {
-      const newProduct: Product = {
-        ...formData,
-        id: crypto.randomUUID()
-      };
-      setProducts(prev => [newProduct, ...prev]);
+  // Firestore listener
+  useEffect(() => {
+    if (!user) {
+      setProducts([]);
+      setCategories([]);
+      return;
     }
-    resetForm();
+
+    const qCategories = query(
+      collection(db, 'categories'),
+      where('userId', '==', user.uid)
+    );
+    const unsubCategories = onSnapshot(qCategories, (snapshot) => {
+      const categoryData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })) as Category[];
+      setCategories(categoryData);
+    }, (error) => {
+      console.error('Error fetching categories:', error);
+      alert('カテゴリの取得に失敗しました。Firestoreのセキュリティルールが設定されていない可能性があります。(Error: ' + error.message + ')');
+    });
+    
+    const q = query(
+      collection(db, 'products'),
+      where('userId', '==', user.uid)
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const productListData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })) as Product[];
+      
+      productListData.sort((a, b) => {
+        const timeA = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
+        const timeB = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+        return timeB - timeA;
+      });
+      
+      setProducts(productListData);
+    }, (error) => {
+      console.error('Error fetching products:', error);
+      alert('データの取得に失敗しました。Firestoreのセキュリティルールが設定されていない可能性があります。');
+    });
+
+    return () => {
+      unsubscribe();
+      unsubCategories();
+    };
+  }, [user]);
+
+  const handleLogin = async () => {
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (error) {
+      console.error('Login failed', error);
+      alert('ログインに失敗しました');
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+    } catch (error) {
+      console.error('Logout failed', error);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user) return;
+
+    try {
+      if (editingId) {
+        const productRef = doc(db, 'products', editingId);
+        await updateDoc(productRef, { ...formData });
+        setEditingId(null);
+      } else {
+        await addDoc(collection(db, 'products'), {
+          ...formData,
+          userId: user.uid,
+          createdAt: Timestamp.now()
+        });
+      }
+      resetForm();
+    } catch (error) {
+      console.error('Error saving document: ', error);
+      alert('保存に失敗しました。Firestoreのセキュリティルールを確認してください。');
+    }
   };
 
   const resetForm = () => {
     setFormData({
       name: '',
+      categoryId: '',
       purchasePrice: 0,
       salePrice: 0,
       status: '発送待ち',
@@ -87,35 +208,61 @@ export default function App() {
   };
 
   const handleEdit = (product: Product) => {
-    setFormData({ ...product });
+    setFormData({
+      name: product.name,
+      categoryId: product.categoryId || '',
+      purchasePrice: product.purchasePrice,
+      salePrice: product.salePrice,
+      status: product.status,
+      purchaseDate: product.purchaseDate,
+      shippingDate: product.shippingDate,
+      completionDate: product.completionDate
+    });
     setEditingId(product.id);
     setShowForm(true);
   };
 
-  const handleDelete = (id: string) => {
+  const handleDelete = async (id: string) => {
     if (window.confirm('この商品を削除してもよろしいですか？')) {
-      setProducts(prev => prev.filter(p => p.id !== id));
+      try {
+        await deleteDoc(doc(db, 'products', id));
+      } catch (error) {
+        console.error('Error deleting document: ', error);
+        alert('削除に失敗しました。');
+      }
     }
   };
 
-  const updateProductDate = (id: string, field: 'shippingDate' | 'completionDate', value: string) => {
-    setProducts(prev => prev.map(p => p.id === id ? { ...p, [field]: value } : p));
+  const updateProductDate = async (id: string, field: 'shippingDate' | 'completionDate', value: string) => {
+    try {
+      const productRef = doc(db, 'products', id);
+      await updateDoc(productRef, { [field]: value });
+    } catch (error) {
+      console.error('Error updating date: ', error);
+    }
   };
 
-  const updateStatus = (id: string, newStatus: Status) => {
-    setProducts(prev => prev.map(p => {
-      if (p.id === id) {
-        const today = new Date().toISOString().split('T')[0];
-        let shippingDate = p.shippingDate;
-        let completionDate = p.completionDate;
+  const updateStatus = async (id: string, newStatus: Status) => {
+    const product = products.find(p => p.id === id);
+    if (!product) return;
 
-        if (newStatus === '発送済み' && !shippingDate) shippingDate = today;
-        if (newStatus === '取引終了' && !completionDate) completionDate = today;
+    const today = new Date().toISOString().split('T')[0];
+    let shippingDate = product.shippingDate;
+    let completionDate = product.completionDate;
 
-        return { ...p, status: newStatus, shippingDate, completionDate };
-      }
-      return p;
-    }));
+    if (newStatus === '発送済み' && !shippingDate) shippingDate = today;
+    if (newStatus === '取引終了' && !completionDate) completionDate = today;
+
+    try {
+      const productRef = doc(db, 'products', id);
+      await updateDoc(productRef, {
+        status: newStatus,
+        shippingDate,
+        completionDate
+      });
+    } catch (error) {
+      console.error('Error updating status: ', error);
+    }
   };
 
   const getStatusIcon = (status: Status) => {
@@ -136,20 +283,97 @@ export default function App() {
     }
   };
 
+  if (!user) {
+    return (
+      <div className="container" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '80vh' }}>
+        <div className="glass-card" style={{ padding: '3rem', textAlign: 'center', maxWidth: '400px', width: '100%' }}>
+          <Package size={64} style={{ color: 'var(--primary)', marginBottom: '1.5rem' }} />
+          <h1 style={{ marginBottom: '1rem' }}>物販進捗管理</h1>
+          <p style={{ color: 'var(--text-dim)', marginBottom: '2rem' }}>
+            データはクラウドに安全に保存され、自分のデータのみを管理できます。
+          </p>
+          <button className="primary btn-icon" onClick={handleLogin} style={{ width: '100%', justifyContent: 'center', padding: '1rem' }}>
+            <LogIn size={20} />
+            Googleでログインして始める
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   const totalProfit = products.reduce((sum, p) => 
     p.status === '取引終了' ? sum + (p.salePrice - p.purchasePrice) : sum, 0);
 
+  const handleAddCategory = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newCategoryName.trim() || !user) return;
+    try {
+      await addDoc(collection(db, 'categories'), {
+        name: newCategoryName.trim(),
+        userId: user.uid,
+        createdAt: Timestamp.now()
+      });
+      setNewCategoryName('');
+    } catch (error) {
+      console.error('Error adding category:', error);
+      alert('カテゴリの追加に失敗しました。');
+    }
+  };
+
+  const handleDeleteCategory = async (id: string) => {
+    if (products.some(p => p.categoryId === id)) {
+      alert('このカテゴリは使用されているため削除できません。');
+      return;
+    }
+    if (window.confirm('このカテゴリを削除してもよろしいですか？')) {
+      try {
+        await deleteDoc(doc(db, 'categories', id));
+      } catch (error) {
+        console.error('Error deleting category:', error);
+      }
+    }
+  };
+
   return (
     <div className="container">
-      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <h1>物販進捗管理</h1>
-        <button className="primary btn-icon" onClick={() => setShowForm(true)}>
-          <Plus size={20} />
-          新規追加
-        </button>
+      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '2rem' }}>
+          <h1>物販進捗管理</h1>
+          <div style={{ display: 'flex', gap: '1rem', borderBottom: '1px solid var(--card-border)' }}>
+            <button 
+              onClick={() => setActiveTab('list')}
+              style={{ background: 'transparent', border: 'none', padding: '0.5rem 1rem', borderBottom: activeTab === 'list' ? '2px solid var(--primary)' : '2px solid transparent', color: activeTab === 'list' ? 'var(--text-main)' : 'var(--text-dim)', fontWeight: activeTab === 'list' ? 'bold' : 'normal', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <Package size={16} />一覧表示
+            </button>
+            <button 
+              onClick={() => setActiveTab('chart')}
+              style={{ background: 'transparent', border: 'none', padding: '0.5rem 1rem', borderBottom: activeTab === 'chart' ? '2px solid var(--primary)' : '2px solid transparent', color: activeTab === 'chart' ? 'var(--text-main)' : 'var(--text-dim)', fontWeight: activeTab === 'chart' ? 'bold' : 'normal', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <BarChart3 size={16} />利益グラフ
+            </button>
+          </div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', background: 'var(--surface)', padding: '0.5rem 1rem', borderRadius: '2rem' }}>
+            <img src={user.photoURL || ''} alt={user.displayName || 'User'} style={{ width: 24, height: 24, borderRadius: '50%' }} />
+            <span style={{ fontSize: '0.9rem' }}>{user.displayName}</span>
+            <button onClick={handleLogout} className="btn-icon" style={{ background: 'transparent', padding: '0.25rem', color: 'var(--text-dim)', border: 'none' }} title="ログアウト">
+              <LogOut size={16} />
+            </button>
+          </div>
+          <button className="btn-icon" onClick={() => setShowCategoryMaster(true)} style={{ background: 'rgba(255,255,255,0.05)', color: 'white', border: '1px solid var(--card-border)' }}>
+            <FolderOpen size={20} />
+            カテゴリ管理
+          </button>
+          <button className="primary btn-icon" onClick={() => setShowForm(true)}>
+            <Plus size={20} />
+            新規追加
+          </button>
+        </div>
       </header>
 
-      <div className="grid">
+      {activeTab === 'list' ? (
+        <>
+          <div className="grid">
         <div className="stat-card glass-card">
           <label><Package size={14} style={{ marginRight: 4 }} /> 登録商品数</label>
           <div className="stat-value">{products.length} <span style={{ fontSize: '1rem', color: 'var(--text-dim)' }}>個</span></div>
@@ -172,7 +396,8 @@ export default function App() {
         <table>
           <thead>
             <tr>
-              <th style={{ width: '40%', minWidth: '200px' }}>商品名</th>
+              <th style={{ width: '30%', minWidth: '150px' }}>商品名</th>
+              <th>カテゴリ</th>
               <th>金額情報</th>
               <th>ステータス</th>
               <th>日付情報</th>
@@ -182,7 +407,12 @@ export default function App() {
           <tbody>
             {products.map(product => (
               <tr key={product.id}>
-                <td style={{ fontWeight: 600, whiteSpace: 'normal', minWidth: '200px', lineHeight: '1.4' }}>{product.name}</td>
+                <td style={{ fontWeight: 600, whiteSpace: 'normal', minWidth: '150px', lineHeight: '1.4' }}>{product.name}</td>
+                <td>
+                  <span style={{ background: 'rgba(255,255,255,0.05)', padding: '0.25rem 0.5rem', borderRadius: '0.5rem', fontSize: '0.8rem', color: 'var(--text-dim)' }}>
+                    {categories.find(c => c.id === product.categoryId)?.name || '未分類'}
+                  </span>
+                </td>
                 <td>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', fontSize: '0.875rem' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem' }}>
@@ -270,6 +500,69 @@ export default function App() {
           </div>
         )}
       </div>
+      </>
+      ) : (
+        <div className="glass-card" style={{ padding: '2rem', marginTop: '2rem' }}>
+          <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginBottom: '2rem', flexWrap: 'wrap' }}>
+            <select 
+               value={chartPeriodType}
+               onChange={e => setChartPeriodType(e.target.value as 'month' | 'custom')}
+               style={{ padding: '0.5rem', background: 'var(--surface)', border: '1px solid var(--card-border)', borderRadius: '0.5rem', color: 'var(--text-main)' }}
+            >
+              <option value="month">月ごと</option>
+              <option value="custom">期間指定</option>
+            </select>
+            
+            {chartPeriodType === 'month' ? (
+              <input 
+                 type="month" 
+                 value={chartMonth}
+                 onChange={e => setChartMonth(e.target.value)}
+                 style={{ padding: '0.5rem', background: 'transparent', border: '1px solid var(--card-border)', borderRadius: '0.5rem', color: 'var(--text-main)' }}
+              />
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <input 
+                   type="date" 
+                   value={chartStartDate}
+                   onChange={e => setChartStartDate(e.target.value)}
+                   style={{ padding: '0.5rem', background: 'transparent', border: '1px solid var(--card-border)', borderRadius: '0.5rem', color: 'var(--text-main)' }}
+                />
+                <span>～</span>
+                <input 
+                   type="date" 
+                   value={chartEndDate}
+                   onChange={e => setChartEndDate(e.target.value)}
+                   style={{ padding: '0.5rem', background: 'transparent', border: '1px solid var(--card-border)', borderRadius: '0.5rem', color: 'var(--text-main)' }}
+                />
+              </div>
+            )}
+          </div>
+
+          {chartData.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-dim)' }}>
+              指定された期間に完了した売上がありません。
+            </div>
+          ) : (
+            <div style={{ height: '400px', width: '100%' }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#ffffff20" />
+                  <XAxis dataKey="name" stroke="var(--text-dim)" />
+                  <YAxis stroke="var(--text-dim)" />
+                  <Tooltip 
+                    cursor={{fill: '#ffffff10'}}
+                    contentStyle={{ background: 'var(--surface)', border: '1px solid var(--card-border)', borderRadius: '0.5rem', color: 'var(--text-main)' }} 
+                    formatter={(value) => [`¥${Number(value).toLocaleString()}`, '利益']}
+                  />
+                  <Legend />
+                  <Bar dataKey="profit" name="利益金額" fill="var(--primary)" radius={[4, 4, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </div>
+      )}
 
       {showForm && (
         <div className="modal-overlay">
@@ -285,6 +578,19 @@ export default function App() {
                   onChange={e => setFormData({ ...formData, name: e.target.value })} 
                   placeholder="例: iPhone 15 Pro"
                 />
+              </div>
+              <div className="form-group">
+                <label>カテゴリ</label>
+                <select 
+                  required
+                  value={formData.categoryId}
+                  onChange={e => setFormData({ ...formData, categoryId: e.target.value })}
+                >
+                  <option value="">カテゴリを選択してください</option>
+                  {categories.map(c => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
                 <div className="form-group">
@@ -362,6 +668,57 @@ export default function App() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {showCategoryMaster && (
+        <div className="modal-overlay">
+          <div className="glass-card" style={{ width: '100%', maxWidth: '400px', maxHeight: '80vh', display: 'flex', flexDirection: 'column' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+              <h2 style={{ fontSize: '1.25rem' }}>カテゴリ管理</h2>
+              <button className="btn-icon" onClick={() => setShowCategoryMaster(false)} style={{ background: 'transparent', padding: '0.5rem' }}>
+                <XCircle size={20} style={{ color: 'var(--text-dim)' }} />
+              </button>
+            </div>
+            
+            <form onSubmit={handleAddCategory} style={{ display: 'flex', gap: '0.5rem', marginBottom: '1.5rem' }}>
+              <input 
+                required
+                type="text" 
+                value={newCategoryName} 
+                onChange={e => setNewCategoryName(e.target.value)} 
+                placeholder="新しいカテゴリ名"
+                style={{ flex: 1 }}
+              />
+              <button type="submit" className="primary btn-icon" style={{ padding: '0.5rem 1rem' }}>
+                <Plus size={16} /> 追加
+              </button>
+            </form>
+
+            <div style={{ overflowY: 'auto', flex: 1, border: '1px solid var(--card-border)', borderRadius: '0.75rem', background: 'rgba(0,0,0,0.2)' }}>
+              {categories.length === 0 ? (
+                <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--text-dim)', fontSize: '0.875rem' }}>
+                  カテゴリがありません。<br />上から追加してください。
+                </div>
+              ) : (
+                <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
+                  {categories.map(cat => (
+                    <li key={cat.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.75rem 1rem', borderBottom: '1px solid var(--card-border)' }}>
+                      <span>{cat.name}</span>
+                      <button 
+                        onClick={() => handleDeleteCategory(cat.id)}
+                        className="btn-icon" 
+                        style={{ background: 'transparent', color: 'var(--status-cancelled)', padding: '0.25rem', border: 'none' }}
+                        title="商品が登録されている場合は削除できません"
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
           </div>
         </div>
       )}
